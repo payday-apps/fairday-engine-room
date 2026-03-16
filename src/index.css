@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+@theme {
+  --color-dark: #09090b;
+  --color-surface: #18181b;
+  --color-surface-elevated: #27272a;
+  --color-neon: #CCFF00;
+}
+
+body {
+  background-color: var(--color-dark);
+  color: #e4e4e7;
+}

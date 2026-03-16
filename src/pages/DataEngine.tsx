@@ -25,6 +25,32 @@ interface Claim {
   raw_data: Record<string, any>;
 }
 
+function timeAgo(dateStr: string): string {
+  const now = Date.now();
+  const then = new Date(dateStr).getTime();
+  const diffMs = now - then;
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return 'just now';
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDays = Math.floor(diffHr / 24);
+  if (diffDays === 1) return 'yesterday';
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return new Date(dateStr).toLocaleDateString();
+}
+
+function isRecent(dateStr: string): boolean {
+  return Date.now() - new Date(dateStr).getTime() < 24 * 60 * 60 * 1000;
+}
+
+function getConfidenceTier(score: number): { label: string; color: string } {
+  if (score >= 0.90) return { label: 'Excellent', color: 'text-emerald-400 border-emerald-500/20 bg-emerald-500/10' };
+  if (score >= 0.80) return { label: 'Strong', color: 'text-emerald-400 border-emerald-500/20 bg-emerald-500/5' };
+  if (score >= 0.65) return { label: 'Moderate', color: 'text-amber-400 border-amber-500/20 bg-amber-500/5' };
+  return { label: 'Needs Review', color: 'text-red-400 border-red-500/20 bg-red-500/5' };
+}
+
 export default function DataEngine() {
   const [claims, setClaims] = useState<Claim[]>([]);
   const [totalPending, setTotalPending] = useState<number>(0);
@@ -33,7 +59,7 @@ export default function DataEngine() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
-  const [filter, setFilter] = useState<'all' | 'high' | 'risk'>('all');
+  const [filter, setFilter] = useState<'all' | 'high' | 'medium' | 'risk' | 'recent'>('all');
 
   useEffect(() => {
     fetchClaims();
@@ -96,10 +122,12 @@ export default function DataEngine() {
     let list = [...claims];
     // Sort by created_at desc
     list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-    
+
     if (filter === 'all') return list;
-    if (filter === 'high') return list.filter(c => c.confidence_score >= 0.8);
-    if (filter === 'risk') return list.filter(c => !c.raw_data.filing_deadline || Number(c.raw_data.avg_settlement) === 0);
+    if (filter === 'high') return list.filter(c => c.confidence_score >= 0.90);
+    if (filter === 'medium') return list.filter(c => c.confidence_score >= 0.65 && c.confidence_score < 0.90);
+    if (filter === 'risk') return list.filter(c => c.confidence_score < 0.65 || !c.raw_data.filing_deadline || Number(c.raw_data.avg_settlement) === 0);
+    if (filter === 'recent') return list.filter(c => isRecent(c.created_at));
     return list;
   }, [claims, filter]);
 
@@ -255,35 +283,54 @@ export default function DataEngine() {
 
       {/* Control Bar */}
       <div className="flex items-center justify-between mb-6 bg-surface-elevated/40 p-3 rounded-2xl border border-white/10 backdrop-blur-xl sticky top-4 z-10 shadow-2xl">
-        <div className="flex items-center gap-3">
-          <button 
+        <div className="flex items-center gap-2">
+          <button
             onClick={() => setFilter('all')}
             className={cn(
-              "px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all",
+              "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all",
               filter === 'all' ? "bg-white/10 text-white shadow-inner" : "text-zinc-500 hover:text-zinc-300"
             )}
           >
-            All Items
+            All ({claims.length})
           </button>
-          <button 
+          <button
+            onClick={() => setFilter('recent')}
+            className={cn(
+              "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all flex items-center gap-2",
+              filter === 'recent' ? "bg-blue-500/20 text-blue-400 border border-blue-500/30" : "text-zinc-500 hover:text-blue-400/60"
+            )}
+          >
+            <Zap size={14} />
+            New ({claims.filter(c => isRecent(c.created_at)).length})
+          </button>
+          <button
             onClick={() => setFilter('high')}
             className={cn(
-              "px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all flex items-center gap-2",
+              "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all flex items-center gap-2",
               filter === 'high' ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" : "text-zinc-500 hover:text-emerald-400/60"
             )}
           >
             <Sparkles size={14} />
-            High Conf
+            Excellent ({claims.filter(c => c.confidence_score >= 0.90).length})
           </button>
-          <button 
+          <button
+            onClick={() => setFilter('medium')}
+            className={cn(
+              "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all flex items-center gap-2",
+              filter === 'medium' ? "bg-amber-500/20 text-amber-400 border border-amber-500/30" : "text-zinc-500 hover:text-amber-400/60"
+            )}
+          >
+            Moderate ({claims.filter(c => c.confidence_score >= 0.65 && c.confidence_score < 0.90).length})
+          </button>
+          <button
             onClick={() => setFilter('risk')}
             className={cn(
-              "px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all flex items-center gap-2",
-              filter === 'risk' ? "bg-amber-500/20 text-amber-400 border border-amber-500/30" : "text-zinc-500 hover:text-amber-400/60"
+              "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all flex items-center gap-2",
+              filter === 'risk' ? "bg-red-500/20 text-red-400 border border-red-500/30" : "text-zinc-500 hover:text-red-400/60"
             )}
           >
             <AlertCircle size={14} />
-            Check Logic
+            Needs Work ({claims.filter(c => c.confidence_score < 0.65 || !c.raw_data.filing_deadline || Number(c.raw_data.avg_settlement) === 0).length})
           </button>
         </div>
 
@@ -358,13 +405,20 @@ export default function DataEngine() {
                     </td>
                     
                     <td className="p-6 max-w-md">
-                      <div className="font-black text-[17px] text-white leading-tight group-hover:text-neon transition-colors tracking-tight">
-                        {claim.raw_data.title}
+                      <div className="flex items-center gap-2">
+                        <div className="font-black text-[17px] text-white leading-tight group-hover:text-neon transition-colors tracking-tight">
+                          {claim.raw_data.title}
+                        </div>
+                        {isRecent(claim.created_at) && (
+                          <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-wider bg-blue-500/20 text-blue-400 border border-blue-500/30 shrink-0">New</span>
+                        )}
                       </div>
                       <div className="flex items-center gap-3 mt-3">
                         <span className="text-[10px] text-zinc-500 font-black uppercase tracking-widest">{claim.raw_data.company_name || 'N/A'}</span>
                         <div className="w-1.5 h-1.5 rounded-full bg-zinc-800"></div>
-                        <span className="text-[10px] text-zinc-600 font-mono italic">TS: {new Date(claim.created_at).toLocaleDateString()}</span>
+                        <span className={cn("text-[10px] font-mono font-bold", isRecent(claim.created_at) ? "text-blue-400" : "text-zinc-600")} title={new Date(claim.created_at).toLocaleString()}>
+                          {timeAgo(claim.created_at)}
+                        </span>
                       </div>
                     </td>
 
@@ -377,14 +431,21 @@ export default function DataEngine() {
 
                     <td className="p-6 text-center">
                       <div className="flex flex-col items-center gap-2">
-                        <div className={cn(
-                          "px-2.5 py-1 rounded-lg text-[10px] font-black uppercase border tracking-tighter",
-                          claim.confidence_score >= 0.8 ? "text-emerald-400 border-emerald-500/20 bg-emerald-500/5" : "text-zinc-500 border-white/5"
-                        )}>
-                          {(claim.confidence_score * 100).toFixed(0)}% Accuracy
-                        </div>
+                        {(() => {
+                          const conf = getConfidenceTier(claim.confidence_score);
+                          return (
+                            <div className={cn("px-2.5 py-1 rounded-lg text-[10px] font-black uppercase border tracking-tighter", conf.color)}>
+                              {(claim.confidence_score * 100).toFixed(0)}% — {conf.label}
+                            </div>
+                          );
+                        })()}
                         <div className="flex items-center gap-2">
-                          <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
+                          <div className={cn(
+                            "w-2.5 h-2.5 rounded-full",
+                            claim.confidence_score >= 0.90 ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" :
+                            claim.confidence_score >= 0.65 ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.3)]" :
+                            "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.3)]"
+                          )}></div>
                           <span className="text-[9px] text-zinc-500 font-black uppercase tracking-widest font-mono">Plaid Logic Ready</span>
                         </div>
                       </div>

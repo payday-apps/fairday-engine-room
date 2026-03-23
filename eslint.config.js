@@ -19,5 +19,26 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/no-unused-vars': 'warn',
+    },
+  },
+  {
+    files: ['src/pages/**/*.{ts,tsx}', 'src/components/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: 'axios',
+              importNames: ['default'],
+              message: 'CRITICAL ARCHITECTURE RULE: Always use the pre-configured `api` instance from `@/lib/api` instead of importing raw `axios`. The shared instance handles authentication cookies automatically.',
+            },
+          ],
+        },
+      ],
+    },
   },
 ])

@@ -1,18 +1,12 @@
 import { useState, useEffect, useMemo, Fragment } from 'react';
-import axios from 'axios';
 import {
-  Mail,
   ChevronDown,
   ChevronUp,
   Inbox,
   Loader2
 } from 'lucide-react';
 import { cn } from '../lib/utils';
-
-const contactApi = axios.create({
-  baseURL: 'https://staging-api.fairday.app/api/admin/contact-submissions',
-  withCredentials: true,
-});
+import { api } from '../lib/api';
 
 type SubmissionStatus = 'new' | 'in_progress' | 'resolved' | 'spam';
 
@@ -64,7 +58,10 @@ export default function ContactSubmissions() {
   const fetchSubmissions = async () => {
     try {
       setLoading(true);
-      const res = await contactApi.get('/');
+      // api instance is based at /api/admin/claims. Since we want /api/admin/contact-submissions, 
+      // we need to override the baseURL or just use an absolute path for this specific call
+      // to keep it simple, we'll hit the absolute path but use the api instance so credentials pass.
+      const res = await api.get('https://staging-api.fairday.app/api/admin/contact-submissions/');
       setSubmissions(res.data.submissions || res.data || []);
     } catch (error) {
       console.error('Failed to fetch contact submissions:', error);
@@ -76,7 +73,7 @@ export default function ContactSubmissions() {
   const updateStatus = async (id: string, newStatus: SubmissionStatus) => {
     try {
       setUpdatingId(id);
-      await contactApi.patch(`/${id}`, { status: newStatus });
+      await api.patch(`https://staging-api.fairday.app/api/admin/contact-submissions/${id}`, { status: newStatus });
       setSubmissions(prev =>
         prev.map(s => (s.id === id ? { ...s, status: newStatus } : s))
       );

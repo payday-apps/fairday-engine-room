@@ -119,7 +119,7 @@ export default function DataEngine() {
   };
 
   const filteredClaims = useMemo(() => {
-    let list = [...claims];
+    const list = [...claims];
     // Sort by created_at desc
     list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 

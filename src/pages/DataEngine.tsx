@@ -1,18 +1,24 @@
 import { useState, useEffect, useMemo } from 'react';
 import { api } from '../lib/api';
-import { 
-  Check, 
-  AlertCircle, 
-  Sparkles, 
-  CheckCircle2, 
-  Database, 
+import {
+  Check,
+  AlertCircle,
+  Sparkles,
+  CheckCircle2,
+  Database,
   Globe,
   Gavel,
   Info,
   ShieldAlert,
-  Zap
+  Zap,
+  Download,
+  Loader2,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { showToast } from '../lib/toast';
+import { ToastContainer } from '../components/Toast';
+import PromoteModal from '../components/PromoteModal';
+import ConfirmModal from '../components/ConfirmModal';
 
 interface Claim {
   id: string;
@@ -23,6 +29,11 @@ interface Claim {
   missing_fields: string[];
   created_at: string;
   raw_data: Record<string, any>;
+}
+
+interface ValidationError {
+  claimId: string;
+  errors: Array<{ path: string[]; message: string }>;
 }
 
 function timeAgo(dateStr: string): string {
@@ -60,13 +71,17 @@ export default function DataEngine() {
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
   const [filter, setFilter] = useState<'all' | 'high' | 'medium' | 'risk' | 'recent'>('all');
+  const [exporting, setExporting] = useState(false);
+  const [validationErrors, setValidationErrors] = useState<Map<string, ValidationError>>(new Map());
+  const [promoteOpen, setPromoteOpen] = useState(false);
+  const [confirmEngineOpen, setConfirmEngineOpen] = useState(false);
+  const [engineTriggering, setEngineTriggering] = useState(false);
 
   useEffect(() => {
     fetchClaims();
     fetchSources();
     fetchEngineStatus();
-    
-    // Poll engine status every 10 seconds if running
+
     const interval = setInterval(() => {
       fetchEngineStatus();
     }, 10000);
@@ -83,16 +98,23 @@ export default function DataEngine() {
   };
 
   const handleTriggerEngine = async () => {
-    if (!window.confirm("Are you sure you want to trigger a manual run of Engine 2? This will scrape all sources and consume AI tokens.")) return;
-    
+    setConfirmEngineOpen(true);
+  };
+
+  const confirmTriggerEngine = async () => {
     try {
+      setEngineTriggering(true);
       setEngineStatus({ ...engineStatus, status: 'STARTING...' });
       await api.post('/engine/trigger');
+      setConfirmEngineOpen(false);
+      showToast('Pipeline triggered successfully', 'success');
       setTimeout(fetchEngineStatus, 2000);
     } catch (error) {
       console.error('Failed to trigger engine:', error);
-      alert('Failed to trigger engine. See console for details.');
+      showToast('Failed to trigger engine. See console for details.', 'error');
       fetchEngineStatus();
+    } finally {
+      setEngineTriggering(false);
     }
   };
 
@@ -120,7 +142,6 @@ export default function DataEngine() {
 
   const filteredClaims = useMemo(() => {
     const list = [...claims];
-    // Sort by created_at desc
     list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
     if (filter === 'all') return list;
@@ -150,17 +171,39 @@ export default function DataEngine() {
     if (selectedIds.size === 0) return;
     try {
       setProcessing(true);
+      setValidationErrors(new Map());
       const res = await api.post('/batch/approve', { ids: Array.from(selectedIds) });
+
+      const successCount = res.data.results?.filter((r: any) => r.success).length || 0;
+      const failCount = res.data.results?.filter((r: any) => !r.success).length || 0;
+
+      // Track validation errors for failed rows
+      const newErrors = new Map<string, ValidationError>();
+      for (const result of res.data.results || []) {
+        if (!result.success && result.validation_errors) {
+          newErrors.set(result.id, {
+            claimId: result.id,
+            errors: result.validation_errors.map((e: any) => ({
+              path: e.path || [],
+              message: e.message || 'Unknown error',
+            })),
+          });
+        }
+      }
+      setValidationErrors(newErrors);
+
       const listRes = await api.get('/review-queue?status=pending&limit=100');
       setClaims(listRes.data.items || []);
       setTotalPending(listRes.data.pagination?.total || (listRes.data.items || []).length);
       setSelectedIds(new Set());
-      
-      const successCount = res.data.results?.filter((r: any) => r.success).length || 0;
-      const failCount = res.data.results?.filter((r: any) => !r.success).length || 0;
-      alert(`Batch approve complete: ${successCount} published successfully, ${failCount} failed.`);
+
+      if (failCount > 0) {
+        showToast(`${successCount}/${successCount + failCount} published, ${failCount} failed`, 'warning');
+      } else {
+        showToast(`${successCount} claims published to staging`, 'success');
+      }
     } catch (error) {
-      alert('Batch approval failed');
+      showToast('Batch approval failed', 'error');
     } finally {
       setProcessing(false);
     }
@@ -168,21 +211,84 @@ export default function DataEngine() {
 
   const approveClaim = async (id: string, title: string) => {
     try {
-      await api.post(`/review-queue/${id}/publish`);
+      setValidationErrors((prev) => {
+        const next = new Map(prev);
+        next.delete(id);
+        return next;
+      });
+      const res = await api.post(`/review-queue/${id}/publish`);
       setClaims(claims.filter(c => c.id !== id));
       setTotalPending(prev => Math.max(0, prev - 1));
-      
-      // Remove from selected if it was selected
+
       if (selectedIds.has(id)) {
         const next = new Set(selectedIds);
         next.delete(id);
         setSelectedIds(next);
       }
-      
-      alert(`Success: "${title}" has been published to the live feed.`);
+
+      showToast(`Published "${title}" to staging feed`, 'success');
     } catch (error: any) {
       console.error('Publish failed:', error);
-      alert(`Failed to publish: ${error.response?.data?.error || error.message}`);
+      const responseData = error.response?.data;
+
+      // Handle Zod validation errors
+      if (responseData?.fields) {
+        const newErrors = new Map(validationErrors);
+        newErrors.set(id, {
+          claimId: id,
+          errors: responseData.fields.map((e: any) => ({
+            path: e.path || [],
+            message: e.message || 'Unknown error',
+          })),
+        });
+        setValidationErrors(newErrors);
+        showToast(`Validation failed for "${title}"`, 'error');
+      } else {
+        showToast(`Failed to publish: ${responseData?.error || error.message}`, 'error');
+      }
+    }
+  };
+
+  const handleExportCSV = async () => {
+    if (selectedIds.size === 0) return;
+    try {
+      setExporting(true);
+      const res = await api.get('/review-queue/export', {
+        params: { ids: [...selectedIds].join(',') },
+        responseType: 'blob',
+      });
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `claims_review_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast(`Exported ${selectedIds.size} claims`, 'success');
+    } catch (error) {
+      showToast('Export failed', 'error');
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handlePromote = async () => {
+    try {
+      const res = await api.post('/promote-staging');
+      setPromoteOpen(false);
+      showToast(`${res.data.rows_promoted} rows promoted to production`, 'success');
+    } catch (error: any) {
+      const status = error.response?.status;
+      const msg = error.response?.data?.error || 'Promotion failed';
+      if (status === 409) {
+        showToast('Conflict: production file was modified. Please retry.', 'error');
+      } else if (status === 400) {
+        showToast(msg, 'error');
+      } else if (status === 404) {
+        showToast('No staging file found. Publish claims first.', 'error');
+      } else {
+        showToast(msg, 'error');
+      }
+      throw error; // Let PromoteModal handle loading state
     }
   };
 
@@ -197,6 +303,22 @@ export default function DataEngine() {
 
   return (
     <div className="p-8 max-w-7xl mx-auto min-h-screen pb-32">
+      <ToastContainer />
+      <PromoteModal
+        open={promoteOpen}
+        onClose={() => setPromoteOpen(false)}
+        onConfirm={handlePromote}
+      />
+      <ConfirmModal
+        open={confirmEngineOpen}
+        onClose={() => setConfirmEngineOpen(false)}
+        onConfirm={confirmTriggerEngine}
+        title="Trigger Pipeline"
+        message="Are you sure you want to trigger a manual run of Engine 2? This will scrape all sources and consume AI tokens."
+        confirmText="Run Pipeline"
+        loading={engineTriggering}
+      />
+
       {/* Strategic Header */}
       <div className="mb-8">
         <div className="flex justify-between items-start">
@@ -256,10 +378,10 @@ export default function DataEngine() {
                   <Globe size={10} /> Live Sources
                 </div>
                 {sources.map(s => (
-                  <div 
-                    key={s.id} 
+                  <div
+                    key={s.id}
                     className={cn(
-                      "px-2 py-1 rounded text-[9px] font-black uppercase tracking-wider border flex items-center gap-1.5", 
+                      "px-2 py-1 rounded text-[9px] font-black uppercase tracking-wider border flex items-center gap-1.5",
                       s.enabled ? "text-emerald-400 border-emerald-400/20 bg-emerald-400/5" : "text-zinc-600 border-white/5 bg-white/5"
                     )}
                     title={s.url}
@@ -271,12 +393,19 @@ export default function DataEngine() {
               </div>
             )}
           </div>
-          {/* Queue Metrics */}
-          <div className="flex gap-4 items-center">
+          {/* Queue Metrics + Promote Button */}
+          <div className="flex flex-col items-end gap-4">
             <div className="bg-surface p-5 rounded-2xl border border-white/5 text-center min-w-[160px] shadow-2xl">
               <div className="text-4xl font-black text-neon leading-none">{totalPending}</div>
               <div className="text-[10px] text-zinc-500 uppercase tracking-widest font-black mt-3">Action Queue</div>
             </div>
+            <button
+              onClick={() => setPromoteOpen(true)}
+              className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-black uppercase tracking-wider rounded-lg px-4 py-2 hover:bg-amber-500/20 transition-colors"
+            >
+              <ShieldAlert size={14} />
+              Promote to Prod
+            </button>
           </div>
         </div>
       </div>
@@ -334,15 +463,25 @@ export default function DataEngine() {
           </button>
         </div>
 
-        <div className="flex items-center gap-4 pr-2">
+        <div className="flex items-center gap-3 pr-2">
           {selectedIds.size > 0 && (
-            <button 
-              onClick={batchApprove}
-              disabled={processing}
-              className="bg-neon text-dark text-xs font-black px-8 py-3 rounded-xl hover:scale-[1.03] active:scale-[0.97] transition-all flex items-center gap-3 shadow-[0_0_30px_rgba(204,255,0,0.3)] group"
-            >
-              {processing ? 'Propagating...' : <><CheckCircle2 size={18} /> Publish {selectedIds.size} Claims</>}
-            </button>
+            <>
+              <button
+                onClick={handleExportCSV}
+                disabled={exporting}
+                className="bg-white/5 border border-white/10 text-zinc-400 text-xs font-black uppercase tracking-widest rounded-xl px-6 py-2.5 hover:bg-white/10 hover:text-white transition-all flex items-center gap-2 disabled:opacity-50"
+              >
+                {exporting ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+                {exporting ? 'Exporting...' : 'Export CSV'}
+              </button>
+              <button
+                onClick={batchApprove}
+                disabled={processing}
+                className="bg-neon text-dark text-xs font-black px-8 py-3 rounded-xl hover:scale-[1.03] active:scale-[0.97] transition-all flex items-center gap-3 shadow-[0_0_30px_rgba(204,255,0,0.3)] group"
+              >
+                {processing ? 'Propagating...' : <><CheckCircle2 size={18} /> Publish {selectedIds.size} &rarr; Staging</>}
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -385,148 +524,195 @@ export default function DataEngine() {
                 const isZero = Number(claim.raw_data.avg_settlement) === 0;
                 const noDeadline = !claim.raw_data.filing_deadline;
                 const tier = getSourceTier(claim.source);
-                
+                const claimValidationErrors = validationErrors.get(claim.id);
+
                 return (
-                  <tr 
-                    key={claim.id} 
-                    onClick={() => toggleSelect(claim.id)}
-                    className={cn(
-                      "group cursor-pointer transition-all border-l-4",
-                      isSelected ? "bg-neon/[0.03] border-neon" : "hover:bg-white/[0.01] border-transparent"
-                    )}
-                  >
-                    <td className="p-6">
-                      <div className={cn(
-                        "w-6 h-6 rounded-lg border flex items-center justify-center transition-all",
-                        isSelected ? "bg-neon border-neon shadow-[0_0_10px_rgba(204,255,0,0.3)]" : "border-white/10 group-hover:border-white/20"
-                      )}>
-                        {isSelected && <Check size={14} className="text-dark font-black" />}
-                      </div>
-                    </td>
-                    
-                    <td className="p-6 max-w-md">
-                      <div className="flex items-center gap-2">
-                        <div className="font-black text-[17px] text-white leading-tight group-hover:text-neon transition-colors tracking-tight">
-                          {claim.raw_data.title}
+                  <>
+                    <tr
+                      key={claim.id}
+                      onClick={() => toggleSelect(claim.id)}
+                      className={cn(
+                        "group cursor-pointer transition-all border-l-4",
+                        isSelected ? "bg-neon/[0.03] border-neon" : "hover:bg-white/[0.01] border-transparent"
+                      )}
+                    >
+                      <td className="p-6">
+                        <div className={cn(
+                          "w-6 h-6 rounded-lg border flex items-center justify-center transition-all",
+                          isSelected ? "bg-neon border-neon shadow-[0_0_10px_rgba(204,255,0,0.3)]" : "border-white/10 group-hover:border-white/20"
+                        )}>
+                          {isSelected && <Check size={14} className="text-dark font-black" />}
                         </div>
-                        {isRecent(claim.created_at) && (
-                          <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-wider bg-blue-500/20 text-blue-400 border border-blue-500/30 shrink-0">New</span>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-3 mt-3">
-                        <span className="text-[10px] text-zinc-500 font-black uppercase tracking-widest">{claim.raw_data.company_name || 'N/A'}</span>
-                        <div className="w-1.5 h-1.5 rounded-full bg-zinc-800"></div>
-                        <span className={cn("text-[10px] font-mono font-bold", isRecent(claim.created_at) ? "text-blue-400" : "text-zinc-600")} title={new Date(claim.created_at).toLocaleString()}>
-                          {timeAgo(claim.created_at)}
-                        </span>
-                      </div>
-                    </td>
+                      </td>
 
-                    <td className="p-6 text-center">
-                      <div className={cn("inline-flex px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-[0.1em]", tier.color)}>
-                        {tier.label}
-                      </div>
-                      <div className="text-[9px] text-zinc-600 mt-2 font-mono uppercase tracking-tighter opacity-60 font-bold">{claim.source}</div>
-                    </td>
-
-                    <td className="p-6 text-center">
-                      <div className="flex flex-col items-center gap-2">
-                        {(() => {
-                          const conf = getConfidenceTier(claim.confidence_score);
-                          return (
-                            <div className={cn("px-2.5 py-1 rounded-lg text-[10px] font-black uppercase border tracking-tighter", conf.color)}>
-                              {(claim.confidence_score * 100).toFixed(0)}% — {conf.label}
-                            </div>
-                          );
-                        })()}
+                      <td className="p-6 max-w-md">
                         <div className="flex items-center gap-2">
-                          <div className={cn(
-                            "w-2.5 h-2.5 rounded-full",
-                            claim.confidence_score >= 0.90 ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" :
-                            claim.confidence_score >= 0.65 ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.3)]" :
-                            "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.3)]"
-                          )}></div>
-                          <span className="text-[9px] text-zinc-500 font-black uppercase tracking-widest font-mono">Plaid Logic Ready</span>
-                        </div>
-                      </div>
-                    </td>
-
-                    <td className="p-6">
-                      <div className="flex flex-col gap-2">
-                        <div className={cn("text-xl font-black tracking-tighter flex items-baseline gap-1", isZero ? "text-zinc-700" : "text-white")}>
-                          {isZero ? 'VARIES' : <><span className="text-xs text-zinc-500 font-bold opacity-50">$</span>{Number(claim.raw_data.avg_settlement).toLocaleString()}</>}
-                        </div>
-                        {isZero && claim.raw_data.payout_analysis && (
-                          <div className="text-[10px] text-zinc-400 font-medium italic mt-1 leading-tight max-w-[140px]">
-                            {claim.raw_data.payout_analysis}
+                          <div className="font-black text-[17px] text-white leading-tight group-hover:text-neon transition-colors tracking-tight">
+                            {claim.raw_data.title}
                           </div>
-                        )}
+                          {isRecent(claim.created_at) && (
+                            <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-wider bg-blue-500/20 text-blue-400 border border-blue-500/30 shrink-0">New</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-3 mt-3">
+                          <span className="text-[10px] text-zinc-500 font-black uppercase tracking-widest">{claim.raw_data.company_name || 'N/A'}</span>
+                          <div className="w-1.5 h-1.5 rounded-full bg-zinc-800"></div>
+                          <span className={cn("text-[10px] font-mono font-bold", isRecent(claim.created_at) ? "text-blue-400" : "text-zinc-600")} title={new Date(claim.created_at).toLocaleString()}>
+                            {timeAgo(claim.created_at)}
+                          </span>
+                        </div>
+                      </td>
 
-                        {/* suspicious payout warning */}
-                        {!isZero && claim.raw_data.lawsuit_category === 'Class Action' && Number(claim.raw_data.avg_settlement) > 10000 && (
-                          <div className="flex items-center gap-1 text-red-400 font-black text-[9px] uppercase bg-red-400/10 px-1.5 py-0.5 rounded border border-red-400/20 w-fit">
-                            <ShieldAlert size={10} />
-                            Likely Total Fund Error
-                          </div>
-                        )}
+                      <td className="p-6 text-center">
+                        <div className={cn("inline-flex px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-[0.1em]", tier.color)}>
+                          {tier.label}
+                        </div>
+                        <div className="text-[9px] text-zinc-600 mt-2 font-mono uppercase tracking-tighter opacity-60 font-bold">{claim.source}</div>
+                      </td>
 
-                        <div className="flex items-center gap-2">
-                          {!noDeadline ? (
-                            <div className="flex items-center gap-1.5 text-zinc-400">
-                              <CheckCircle2 size={12} className="text-emerald-500/50" />
-                              <span className="text-[11px] font-black font-mono tracking-tighter">{claim.raw_data.filing_deadline}</span>
-                            </div>
-                          ) : (
-                            <div className="flex flex-col gap-1">
-                              <div className="flex items-center gap-1.5 text-amber-500/80 font-black text-[10px] uppercase tracking-tighter">
-                                <AlertCircle size={12} />
-                                Pending Dates
+                      <td className="p-6 text-center">
+                        <div className="flex flex-col items-center gap-2">
+                          {(() => {
+                            const conf = getConfidenceTier(claim.confidence_score);
+                            return (
+                              <div className={cn("px-2.5 py-1 rounded-lg text-[10px] font-black uppercase border tracking-tighter", conf.color)}>
+                                {(claim.confidence_score * 100).toFixed(0)}% — {conf.label}
                               </div>
-                              {claim.raw_data.deadline_reason && (
-                                <div className="text-[10px] text-zinc-600 italic leading-tight font-medium max-w-[120px]">{claim.raw_data.deadline_reason}</div>
-                              )}
+                            );
+                          })()}
+                          <div className="flex items-center gap-2">
+                            <div className={cn(
+                              "w-2.5 h-2.5 rounded-full",
+                              claim.confidence_score >= 0.90 ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" :
+                              claim.confidence_score >= 0.65 ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.3)]" :
+                              "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.3)]"
+                            )}></div>
+                            <span className="text-[9px] text-zinc-500 font-black uppercase tracking-widest font-mono">Plaid Logic Ready</span>
+                          </div>
+                        </div>
+                      </td>
+
+                      <td className="p-6">
+                        <div className="flex flex-col gap-2">
+                          <div className={cn("text-xl font-black tracking-tighter flex items-baseline gap-1", isZero ? "text-zinc-700" : "text-white")}>
+                            {isZero ? 'VARIES' : <><span className="text-xs text-zinc-500 font-bold opacity-50">$</span>{Number(claim.raw_data.avg_settlement).toLocaleString()}</>}
+                          </div>
+                          {isZero && claim.raw_data.payout_analysis && (
+                            <div className="text-[10px] text-zinc-400 font-medium italic mt-1 leading-tight max-w-[140px]">
+                              {claim.raw_data.payout_analysis}
+                            </div>
+                          )}
+
+                          {!isZero && claim.raw_data.lawsuit_category === 'Class Action' && Number(claim.raw_data.avg_settlement) > 10000 && (
+                            <div className="flex items-center gap-1 text-red-400 font-black text-[9px] uppercase bg-red-400/10 px-1.5 py-0.5 rounded border border-red-400/20 w-fit">
+                              <ShieldAlert size={10} />
+                              Likely Total Fund Error
+                            </div>
+                          )}
+
+                          <div className="flex items-center gap-2">
+                            {!noDeadline ? (
+                              <div className="flex items-center gap-1.5 text-zinc-400">
+                                <CheckCircle2 size={12} className="text-emerald-500/50" />
+                                <span className="text-[11px] font-black font-mono tracking-tighter">{claim.raw_data.filing_deadline}</span>
+                              </div>
+                            ) : (
+                              <div className="flex flex-col gap-1">
+                                <div className="flex items-center gap-1.5 text-amber-500/80 font-black text-[10px] uppercase tracking-tighter">
+                                  <AlertCircle size={12} />
+                                  Pending Dates
+                                </div>
+                                {claim.raw_data.deadline_reason && (
+                                  <div className="text-[10px] text-zinc-600 italic leading-tight font-medium max-w-[120px]">{claim.raw_data.deadline_reason}</div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+
+                          {claim.raw_data.payout_analysis && (
+                            <div className="text-[10px] text-zinc-500 leading-tight border-t border-white/5 pt-2 mt-1">
+                              <span className="text-zinc-600 font-bold uppercase text-[8px] block mb-0.5">AI Analysis:</span>
+                              {claim.raw_data.payout_analysis}
                             </div>
                           )}
                         </div>
+                      </td>
 
-                        {/* Payout analysis detail */}
-                        {claim.raw_data.payout_analysis && (
-                          <div className="text-[10px] text-zinc-500 leading-tight border-t border-white/5 pt-2 mt-1">
-                            <span className="text-zinc-600 font-bold uppercase text-[8px] block mb-0.5">AI Analysis:</span>
-                            {claim.raw_data.payout_analysis}
+                      <td className="p-6 text-right">
+                        <div className="flex justify-end gap-3">
+                          <a
+                            href={`https://staging-api.fairday.app/admin?id=${claim.id}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            className="p-3 rounded-2xl bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white transition-all shadow-lg border border-white/5"
+                            title="View Extracted JSON & Meta"
+                          >
+                            <Info size={18} />
+                          </a>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); approveClaim(claim.id, claim.raw_data.title); }}
+                            className="px-6 py-2.5 rounded-2xl bg-white/5 hover:bg-neon hover:text-dark text-white text-[11px] font-black transition-all hover:shadow-[0_0_20px_rgba(204,255,0,0.4)] uppercase tracking-widest border border-white/5 hover:border-neon"
+                          >
+                            Publish
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+
+                    {/* Inline Validation Error Panel */}
+                    {claimValidationErrors && (
+                      <tr key={`${claim.id}-errors`}>
+                        <td colSpan={6} className="px-6 pb-4">
+                          <div
+                            role="alert"
+                            className="bg-red-500/5 border border-red-500/20 rounded-xl p-4 mt-2"
+                          >
+                            <div className="flex items-center justify-between mb-2">
+                              <span className="text-red-400 text-xs font-black uppercase">
+                                Validation Failed ({claimValidationErrors.errors.length} fields)
+                              </span>
+                              <button
+                                onClick={() => {
+                                  setValidationErrors((prev) => {
+                                    const next = new Map(prev);
+                                    next.delete(claim.id);
+                                    return next;
+                                  });
+                                }}
+                                className="text-zinc-500 text-xs hover:text-zinc-300 transition-colors"
+                              >
+                                Dismiss
+                              </button>
+                            </div>
+                            <ul className="space-y-1">
+                              {claimValidationErrors.errors.map((err, i) => (
+                                <li key={i} className="text-sm text-zinc-400 flex gap-2">
+                                  <span className="text-red-400 font-mono text-xs shrink-0">{err.path.join('.')}</span>
+                                  <span>{err.message}</span>
+                                </li>
+                              ))}
+                            </ul>
+                            <a
+                              href={`https://staging-api.fairday.app/admin?id=${claim.id}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-block mt-3 text-xs text-amber-400 font-bold hover:text-amber-300 transition-colors"
+                            >
+                              Edit Raw Data &rarr;
+                            </a>
                           </div>
-                        )}
-                      </div>
-                    </td>
-
-                    <td className="p-6 text-right">
-                      <div className="flex justify-end gap-3">
-                        <a 
-                          href={`https://staging-api.fairday.app/admin?id=${claim.id}`}
-                          target="_blank"
-                          rel="noreferrer"
-                          onClick={(e) => e.stopPropagation()}
-                          className="p-3 rounded-2xl bg-white/5 hover:bg-white/10 text-zinc-400 hover:text-white transition-all shadow-lg border border-white/5"
-                          title="View Extracted JSON & Meta"
-                        >
-                          <Info size={18} />
-                        </a>
-                        <button 
-                          onClick={(e) => { e.stopPropagation(); approveClaim(claim.id, claim.raw_data.title); }}
-                          className="px-6 py-2.5 rounded-2xl bg-white/5 hover:bg-neon hover:text-dark text-white text-[11px] font-black transition-all hover:shadow-[0_0_20px_rgba(204,255,0,0.4)] uppercase tracking-widest border border-white/5 hover:border-neon"
-                        >
-                          Publish
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
+                        </td>
+                      </tr>
+                    )}
+                  </>
                 );
               })
             )}
           </tbody>
         </table>
       </div>
-      
+
       {/* Paradigm Legend */}
       <div className="mt-16 grid grid-cols-3 gap-8">
         <div className="bg-surface/50 p-8 rounded-[2.5rem] border border-white/5 shadow-2xl backdrop-blur-sm">
@@ -536,7 +722,7 @@ export default function DataEngine() {
           <h4 className="text-base font-black text-white mb-3 tracking-tight">Court Dockets (Tier 1)</h4>
           <p className="text-[13px] text-zinc-500 leading-relaxed font-medium">Direct federal links. These are early alerts where Gemini infers the match logic based on the preliminary approval order.</p>
         </div>
-        
+
         <div className="bg-surface/50 p-8 rounded-[2.5rem] border border-white/5 shadow-2xl backdrop-blur-sm text-center transform scale-105 border-neon/20 ring-1 ring-neon/5 ring-offset-4 ring-offset-dark">
           <div className="w-12 h-12 bg-neon/10 rounded-2xl flex items-center justify-center text-neon mb-6 border border-neon/20 mx-auto">
             <Sparkles size={24} />

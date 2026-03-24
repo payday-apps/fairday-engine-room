@@ -29,6 +29,7 @@ interface Claim {
   missing_fields: string[];
   created_at: string;
   raw_data: Record<string, any>;
+  duplicate_of: string[] | null;
 }
 
 interface ValidationError {
@@ -552,6 +553,9 @@ export default function DataEngine() {
                           </div>
                           {isRecent(claim.created_at) && (
                             <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-wider bg-blue-500/20 text-blue-400 border border-blue-500/30 shrink-0">New</span>
+                          )}
+                          {claim.duplicate_of && (
+                            <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-wider bg-amber-500/20 text-amber-400 border border-amber-500/30 shrink-0" title={`Matches existing claim by: ${claim.duplicate_of.join(', ')}`}>Duplicate</span>
                           )}
                         </div>
                         <div className="flex items-center gap-3 mt-3">

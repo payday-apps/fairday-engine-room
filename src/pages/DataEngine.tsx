@@ -216,7 +216,7 @@ export default function DataEngine() {
         next.delete(id);
         return next;
       });
-      const res = await api.post(`/review-queue/${id}/publish`);
+      await api.post(`/review-queue/${id}/publish`);
       setClaims(claims.filter(c => c.id !== id));
       setTotalPending(prev => Math.max(0, prev - 1));
 

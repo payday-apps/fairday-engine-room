@@ -5,8 +5,8 @@ import {
   Inbox,
   Loader2
 } from 'lucide-react';
+import { ensureProdAdminBearer, prodAdminApi } from '../lib/prodAdminApi';
 import { cn } from '../lib/utils';
-import { api } from '../lib/api';
 
 type SubmissionStatus = 'new' | 'in_progress' | 'resolved' | 'spam';
 
@@ -58,10 +58,12 @@ export default function ContactSubmissions() {
   const fetchSubmissions = async () => {
     try {
       setLoading(true);
-      // Shared `api` stays on the staging claims client. This page uses absolute
-      // production URLs so withCredentials still applies without changing that client.
-      const res = await api.get('https://api.fairday.app/api/admins/contact-submissions');
-      setSubmissions(res.data.submissions || res.data || []);
+      await ensureProdAdminBearer();
+      const res = await prodAdminApi.get<{ data?: ContactSubmission[] }>(
+        '/api/admins/contact-submissions',
+        { params: { limit: 100 } },
+      );
+      setSubmissions(Array.isArray(res.data?.data) ? res.data.data : []);
     } catch (error) {
       console.error('Failed to fetch contact submissions:', error);
     } finally {
@@ -72,7 +74,8 @@ export default function ContactSubmissions() {
   const updateStatus = async (id: string, newStatus: SubmissionStatus) => {
     try {
       setUpdatingId(id);
-      await api.patch(`https://api.fairday.app/api/admins/contact-submissions/${id}/status`, { status: newStatus });
+      await ensureProdAdminBearer();
+      await prodAdminApi.patch(`/api/admins/contact-submissions/${id}/status`, { status: newStatus });
       setSubmissions(prev =>
         prev.map(s => (s.id === id ? { ...s, status: newStatus } : s))
       );

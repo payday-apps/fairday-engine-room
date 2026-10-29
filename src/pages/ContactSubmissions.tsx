@@ -1,12 +1,20 @@
-import { useState, useEffect, useMemo, Fragment } from 'react';
+import { useState, useEffect, useMemo, useCallback, Fragment } from 'react';
 import {
+  AlertCircle,
   ChevronDown,
   ChevronUp,
   Inbox,
   Loader2
 } from 'lucide-react';
+import {
+  AdminApiHostError,
+  CONTACT_SUBMISSIONS_HOST_MESSAGE,
+  CONTACT_SUBMISSIONS_PROD_URL,
+  prodAdminApi,
+  prodAdminErrorMessage,
+  withProdAdminAuth,
+} from '../lib/prodAdminApi';
 import { cn } from '../lib/utils';
-import { api } from '../lib/api';
 
 type SubmissionStatus = 'new' | 'in_progress' | 'resolved' | 'spam';
 
@@ -44,42 +52,70 @@ const statusConfig: Record<SubmissionStatus, { label: string; color: string; bgC
 
 type FilterType = 'all' | SubmissionStatus;
 
+type LoadError = {
+  message: string;
+  hostBlocked: boolean;
+};
+
+const [hostMessageBefore, hostMessageAfter] =
+  CONTACT_SUBMISSIONS_HOST_MESSAGE.split(CONTACT_SUBMISSIONS_PROD_URL);
+
+function toLoadError(error: unknown): LoadError {
+  if (error instanceof AdminApiHostError) {
+    return { hostBlocked: true, message: error.message };
+  }
+  return {
+    hostBlocked: false,
+    message: `Could not load contact submissions. ${prodAdminErrorMessage(error)}`,
+  };
+}
+
 export default function ContactSubmissions() {
   const [submissions, setSubmissions] = useState<ContactSubmission[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<LoadError | null>(null);
   const [filter, setFilter] = useState<FilterType>('all');
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchSubmissions();
-  }, []);
-
-  const fetchSubmissions = async () => {
+  const fetchSubmissions = useCallback(async () => {
     try {
       setLoading(true);
-      // api instance is based at /api/admin/claims. Since we want /api/admin/contact-submissions, 
-      // we need to override the baseURL or just use an absolute path for this specific call
-      // to keep it simple, we'll hit the absolute path but use the api instance so credentials pass.
-      const res = await api.get('https://staging-api.fairday.app/api/admin/contact-submissions/');
-      setSubmissions(res.data.submissions || res.data || []);
+      setLoadError(null);
+      const res = await withProdAdminAuth(() =>
+        prodAdminApi.get<{ data?: ContactSubmission[] }>(
+          '/api/admins/contact-submissions',
+          { params: { limit: 100 } },
+        ),
+      );
+      setSubmissions(Array.isArray(res.data?.data) ? res.data.data : []);
     } catch (error) {
       console.error('Failed to fetch contact submissions:', error);
+      setLoadError(toLoadError(error));
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void fetchSubmissions();
+  }, [fetchSubmissions]);
 
   const updateStatus = async (id: string, newStatus: SubmissionStatus) => {
     try {
       setUpdatingId(id);
-      await api.patch(`https://staging-api.fairday.app/api/admin/contact-submissions/${id}`, { status: newStatus });
+      await withProdAdminAuth(() =>
+        prodAdminApi.patch(`/api/admins/contact-submissions/${id}/status`, { status: newStatus }),
+      );
       setSubmissions(prev =>
         prev.map(s => (s.id === id ? { ...s, status: newStatus } : s))
       );
     } catch (error) {
       console.error('Failed to update status:', error);
-      alert('Failed to update status. See console for details.');
+      const message = error instanceof AdminApiHostError
+        ? error.message
+        : `Failed to update status. ${prodAdminErrorMessage(error)}`;
+      alert(message);
     } finally {
       setUpdatingId(null);
     }
@@ -107,6 +143,52 @@ export default function ContactSubmissions() {
     return (
       <div className="p-8 text-zinc-400 flex items-center gap-3">
         <Loader2 className="animate-spin text-neon" size={20} /> Loading contact submissions...
+      </div>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="p-8 max-w-3xl mx-auto min-h-screen">
+        <h1 className="text-4xl font-black text-white tracking-tighter mb-8">
+          Contact Submissions
+        </h1>
+        <div
+          role="alert"
+          className="bg-surface rounded-[2rem] border border-red-500/20 p-10 shadow-[0_0_50px_rgba(0,0,0,0.5)]"
+        >
+          <div className="w-16 h-16 bg-red-500/10 rounded-full flex items-center justify-center mb-6">
+            <AlertCircle size={32} className="text-red-400" />
+          </div>
+          <div className="text-white font-black text-2xl tracking-tighter">
+            Couldn&apos;t load submissions
+          </div>
+          {loadError.hostBlocked ? (
+            <p className="text-zinc-300 text-sm mt-4 leading-relaxed font-medium">
+              {hostMessageBefore}
+              <a
+                href={CONTACT_SUBMISSIONS_PROD_URL}
+                className="text-neon font-mono hover:underline break-all"
+              >
+                {CONTACT_SUBMISSIONS_PROD_URL}
+              </a>
+              {hostMessageAfter}
+            </p>
+          ) : (
+            <p className="text-zinc-300 text-sm mt-4 leading-relaxed font-medium">
+              {loadError.message}
+            </p>
+          )}
+          {!loadError.hostBlocked && (
+            <button
+              type="button"
+              onClick={() => { void fetchSubmissions(); }}
+              className="mt-6 px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight bg-white/10 text-white hover:bg-white/15"
+            >
+              Retry
+            </button>
+          )}
+        </div>
       </div>
     );
   }

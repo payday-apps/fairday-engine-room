@@ -29,6 +29,7 @@ interface Claim {
   missing_fields: string[];
   created_at: string;
   raw_data: Record<string, any>;
+  duplicate_of: string[] | null;
 }
 
 interface ValidationError {
@@ -55,6 +56,17 @@ function isRecent(dateStr: string): boolean {
   return Date.now() - new Date(dateStr).getTime() < 24 * 60 * 60 * 1000;
 }
 
+function isDuplicateClaim(claim: { duplicate_of: string[] | null }): boolean {
+  return Boolean(claim.duplicate_of && claim.duplicate_of.length > 0);
+}
+
+/**
+ * Pending review queue. The list route ignores exclude query params and always
+ * sets `duplicate_of`. Exclude Dupes is a client filter. Export All sends
+ * `exclude_duplicates=true` on GET /review-queue/export.
+ */
+const REVIEW_QUEUE_PATH = '/review-queue?status=pending&limit=100';
+
 function getConfidenceTier(score: number): { label: string; color: string } {
   if (score >= 0.90) return { label: 'Excellent', color: 'text-emerald-400 border-emerald-500/20 bg-emerald-500/10' };
   if (score >= 0.80) return { label: 'Strong', color: 'text-emerald-400 border-emerald-500/20 bg-emerald-500/5' };
@@ -71,7 +83,8 @@ export default function DataEngine() {
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
   const [filter, setFilter] = useState<'all' | 'high' | 'medium' | 'risk' | 'recent'>('all');
-  const [exporting, setExporting] = useState(false);
+  const [excludeDupes, setExcludeDupes] = useState(false);
+  const [exporting, setExporting] = useState<null | 'csv' | 'all'>(null);
   const [validationErrors, setValidationErrors] = useState<Map<string, ValidationError>>(new Map());
   const [promoteOpen, setPromoteOpen] = useState(false);
   const [confirmEngineOpen, setConfirmEngineOpen] = useState(false);
@@ -130,7 +143,7 @@ export default function DataEngine() {
   const fetchClaims = async () => {
     try {
       setLoading(true);
-      const res = await api.get('/review-queue?status=pending&limit=100');
+      const res = await api.get(REVIEW_QUEUE_PATH);
       setClaims(res.data.items || []);
       setTotalPending(res.data.pagination?.total || (res.data.items || []).length);
     } catch (error) {
@@ -140,8 +153,13 @@ export default function DataEngine() {
     }
   };
 
+  const queueClaims = useMemo(
+    () => (excludeDupes ? claims.filter(c => !isDuplicateClaim(c)) : claims),
+    [claims, excludeDupes],
+  );
+
   const filteredClaims = useMemo(() => {
-    const list = [...claims];
+    const list = [...queueClaims];
     list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
     if (filter === 'all') return list;
@@ -150,7 +168,7 @@ export default function DataEngine() {
     if (filter === 'risk') return list.filter(c => c.confidence_score < 0.65 || !c.raw_data.filing_deadline || Number(c.raw_data.avg_settlement) === 0);
     if (filter === 'recent') return list.filter(c => isRecent(c.created_at));
     return list;
-  }, [claims, filter]);
+  }, [queueClaims, filter]);
 
   const toggleSelect = (id: string) => {
     const next = new Set(selectedIds);
@@ -192,7 +210,7 @@ export default function DataEngine() {
       }
       setValidationErrors(newErrors);
 
-      const listRes = await api.get('/review-queue?status=pending&limit=100');
+      const listRes = await api.get(REVIEW_QUEUE_PATH);
       setClaims(listRes.data.items || []);
       setTotalPending(listRes.data.pagination?.total || (listRes.data.items || []).length);
       setSelectedIds(new Set());
@@ -249,25 +267,57 @@ export default function DataEngine() {
     }
   };
 
+  const downloadExport = async (params: Record<string, string>) => {
+    const res = await api.get('/review-queue/export', {
+      params,
+      responseType: 'blob',
+    });
+    const url = URL.createObjectURL(res.data);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `claims_review_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const handleExportCSV = async () => {
     if (selectedIds.size === 0) return;
     try {
-      setExporting(true);
-      const res = await api.get('/review-queue/export', {
-        params: { ids: [...selectedIds].join(',') },
-        responseType: 'blob',
-      });
-      const url = URL.createObjectURL(res.data);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `claims_review_${new Date().toISOString().slice(0, 10)}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+      setExporting('csv');
+      await downloadExport({ ids: [...selectedIds].join(',') });
       showToast(`Exported ${selectedIds.size} claims`, 'success');
-    } catch (error) {
+    } catch {
       showToast('Export failed', 'error');
     } finally {
-      setExporting(false);
+      setExporting(null);
+    }
+  };
+
+  const handleExportAll = async () => {
+    try {
+      setExporting('all');
+      // Same export route as the selection download. Omit ids so the server
+      // writes the full pending queue. claimsQueue reads exclude_duplicates.
+      const params: Record<string, string> = { status: 'pending' };
+      if (excludeDupes) params.exclude_duplicates = 'true';
+      await downloadExport(params);
+      showToast(excludeDupes ? 'Exported all claims excluding duplicates' : 'Exported all claims', 'success');
+    } catch {
+      showToast('Export failed', 'error');
+    } finally {
+      setExporting(null);
+    }
+  };
+
+  const toggleExcludeDupes = () => {
+    const next = !excludeDupes;
+    setExcludeDupes(next);
+    if (next) {
+      setSelectedIds(prev => {
+        const hidden = new Set(claims.filter(isDuplicateClaim).map(c => c.id));
+        const kept = new Set([...prev].filter(id => !hidden.has(id)));
+        return kept.size === prev.size ? prev : kept;
+      });
     }
   };
 
@@ -420,7 +470,7 @@ export default function DataEngine() {
               filter === 'all' ? "bg-white/10 text-white shadow-inner" : "text-zinc-500 hover:text-zinc-300"
             )}
           >
-            All ({claims.length})
+            All ({queueClaims.length})
           </button>
           <button
             onClick={() => setFilter('recent')}
@@ -430,7 +480,7 @@ export default function DataEngine() {
             )}
           >
             <Zap size={14} />
-            New ({claims.filter(c => isRecent(c.created_at)).length})
+            New ({queueClaims.filter(c => isRecent(c.created_at)).length})
           </button>
           <button
             onClick={() => setFilter('high')}
@@ -440,7 +490,7 @@ export default function DataEngine() {
             )}
           >
             <Sparkles size={14} />
-            Excellent ({claims.filter(c => c.confidence_score >= 0.90).length})
+            Excellent ({queueClaims.filter(c => c.confidence_score >= 0.90).length})
           </button>
           <button
             onClick={() => setFilter('medium')}
@@ -449,7 +499,7 @@ export default function DataEngine() {
               filter === 'medium' ? "bg-amber-500/20 text-amber-400 border border-amber-500/30" : "text-zinc-500 hover:text-amber-400/60"
             )}
           >
-            Moderate ({claims.filter(c => c.confidence_score >= 0.65 && c.confidence_score < 0.90).length})
+            Moderate ({queueClaims.filter(c => c.confidence_score >= 0.65 && c.confidence_score < 0.90).length})
           </button>
           <button
             onClick={() => setFilter('risk')}
@@ -459,20 +509,42 @@ export default function DataEngine() {
             )}
           >
             <AlertCircle size={14} />
-            Needs Work ({claims.filter(c => c.confidence_score < 0.65 || !c.raw_data.filing_deadline || Number(c.raw_data.avg_settlement) === 0).length})
+            Needs Work ({queueClaims.filter(c => c.confidence_score < 0.65 || !c.raw_data.filing_deadline || Number(c.raw_data.avg_settlement) === 0).length})
           </button>
         </div>
 
         <div className="flex items-center gap-3 pr-2">
+          <button
+            type="button"
+            onClick={toggleExcludeDupes}
+            aria-pressed={excludeDupes}
+            className={cn(
+              "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-tight transition-all border whitespace-nowrap shrink-0",
+              excludeDupes
+                ? "bg-amber-500/20 text-amber-400 border-amber-500/30"
+                : "bg-white/5 border-white/10 text-zinc-400 hover:bg-white/10 hover:text-white"
+            )}
+          >
+            Exclude Dupes
+          </button>
+          <button
+            type="button"
+            onClick={handleExportAll}
+            disabled={exporting !== null}
+            className="bg-white/5 border border-white/10 text-zinc-400 text-xs font-black uppercase tracking-widest rounded-xl px-6 py-2.5 hover:bg-white/10 hover:text-white transition-all flex items-center gap-2 disabled:opacity-50 whitespace-nowrap shrink-0"
+          >
+            {exporting === 'all' ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+            {exporting === 'all' ? 'Exporting...' : 'Export All'}
+          </button>
           {selectedIds.size > 0 && (
             <>
               <button
                 onClick={handleExportCSV}
-                disabled={exporting}
+                disabled={exporting !== null}
                 className="bg-white/5 border border-white/10 text-zinc-400 text-xs font-black uppercase tracking-widest rounded-xl px-6 py-2.5 hover:bg-white/10 hover:text-white transition-all flex items-center gap-2 disabled:opacity-50"
               >
-                {exporting ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-                {exporting ? 'Exporting...' : 'Export CSV'}
+                {exporting === 'csv' ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+                {exporting === 'csv' ? 'Exporting...' : 'Export CSV'}
               </button>
               <button
                 onClick={batchApprove}
@@ -552,6 +624,9 @@ export default function DataEngine() {
                           </div>
                           {isRecent(claim.created_at) && (
                             <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-wider bg-blue-500/20 text-blue-400 border border-blue-500/30 shrink-0">New</span>
+                          )}
+                          {claim.duplicate_of && (
+                            <span className="px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-wider bg-amber-500/20 text-amber-400 border border-amber-500/30 shrink-0" title={`Matches existing claim by: ${claim.duplicate_of.join(', ')}`}>Duplicate</span>
                           )}
                         </div>
                         <div className="flex items-center gap-3 mt-3">

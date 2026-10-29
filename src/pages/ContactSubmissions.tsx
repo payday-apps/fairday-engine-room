@@ -58,10 +58,9 @@ export default function ContactSubmissions() {
   const fetchSubmissions = async () => {
     try {
       setLoading(true);
-      // api instance is based at /api/admin/claims. Since we want /api/admin/contact-submissions, 
-      // we need to override the baseURL or just use an absolute path for this specific call
-      // to keep it simple, we'll hit the absolute path but use the api instance so credentials pass.
-      const res = await api.get('https://staging-api.fairday.app/api/admin/contact-submissions/');
+      // Shared `api` stays on the staging claims client. This page uses absolute
+      // production URLs so withCredentials still applies without changing that client.
+      const res = await api.get('https://api.fairday.app/api/admins/contact-submissions');
       setSubmissions(res.data.submissions || res.data || []);
     } catch (error) {
       console.error('Failed to fetch contact submissions:', error);
@@ -73,7 +72,7 @@ export default function ContactSubmissions() {
   const updateStatus = async (id: string, newStatus: SubmissionStatus) => {
     try {
       setUpdatingId(id);
-      await api.patch(`https://staging-api.fairday.app/api/admin/contact-submissions/${id}`, { status: newStatus });
+      await api.patch(`https://api.fairday.app/api/admins/contact-submissions/${id}/status`, { status: newStatus });
       setSubmissions(prev =>
         prev.map(s => (s.id === id ? { ...s, status: newStatus } : s))
       );

@@ -60,12 +60,12 @@ function isDuplicateClaim(claim: { duplicate_of: string[] | null }): boolean {
   return Boolean(claim.duplicate_of && claim.duplicate_of.length > 0);
 }
 
-/** Pending review queue. `exclude_dupes` is the live filter the export route also accepts. */
-function reviewQueuePath(excludeDupes: boolean): string {
-  const params = new URLSearchParams({ status: 'pending', limit: '100' });
-  if (excludeDupes) params.set('exclude_dupes', 'true');
-  return `/review-queue?${params.toString()}`;
-}
+/**
+ * Pending review queue. The list route ignores exclude query params and always
+ * sets `duplicate_of`. Exclude Dupes is a client filter. Export All sends
+ * `exclude_duplicates=true` on GET /review-queue/export.
+ */
+const REVIEW_QUEUE_PATH = '/review-queue?status=pending&limit=100';
 
 function getConfidenceTier(score: number): { label: string; color: string } {
   if (score >= 0.90) return { label: 'Excellent', color: 'text-emerald-400 border-emerald-500/20 bg-emerald-500/10' };
@@ -140,16 +140,16 @@ export default function DataEngine() {
     }
   };
 
-  const fetchClaims = async (exclude = excludeDupes, opts?: { silent?: boolean }) => {
+  const fetchClaims = async () => {
     try {
-      if (!opts?.silent) setLoading(true);
-      const res = await api.get(reviewQueuePath(exclude));
+      setLoading(true);
+      const res = await api.get(REVIEW_QUEUE_PATH);
       setClaims(res.data.items || []);
       setTotalPending(res.data.pagination?.total || (res.data.items || []).length);
     } catch (error) {
       console.error('Failed to fetch claims:', error);
     } finally {
-      if (!opts?.silent) setLoading(false);
+      setLoading(false);
     }
   };
 
@@ -210,7 +210,7 @@ export default function DataEngine() {
       }
       setValidationErrors(newErrors);
 
-      const listRes = await api.get(reviewQueuePath(excludeDupes));
+      const listRes = await api.get(REVIEW_QUEUE_PATH);
       setClaims(listRes.data.items || []);
       setTotalPending(listRes.data.pagination?.total || (listRes.data.items || []).length);
       setSelectedIds(new Set());
@@ -297,9 +297,9 @@ export default function DataEngine() {
     try {
       setExporting('all');
       // Same export route as the selection download. Omit ids so the server
-      // writes the full pending queue; exclude_dupes matches the list filter.
+      // writes the full pending queue. claimsQueue reads exclude_duplicates.
       const params: Record<string, string> = { status: 'pending' };
-      if (excludeDupes) params.exclude_dupes = 'true';
+      if (excludeDupes) params.exclude_duplicates = 'true';
       await downloadExport(params);
       showToast(excludeDupes ? 'Exported all claims excluding duplicates' : 'Exported all claims', 'success');
     } catch {
@@ -319,7 +319,6 @@ export default function DataEngine() {
         return kept.size === prev.size ? prev : kept;
       });
     }
-    fetchClaims(next, { silent: true });
   };
 
   const handlePromote = async () => {

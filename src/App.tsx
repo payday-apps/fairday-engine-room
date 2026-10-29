@@ -56,6 +56,8 @@ export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
 
   useEffect(() => {
+    // Same-origin `/internal/admin-token` on the admin API hosts.
+    // Firebase and other hosts still mint on staging-api for the claims engines.
     authenticateAdmin().then(setIsAuthenticated);
   }, []);
 
